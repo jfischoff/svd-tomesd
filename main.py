@@ -22,7 +22,7 @@ pipe = StableVideoDiffusionPipeline.from_pretrained(
 )
 pipe.to("cuda")
 
-tomesd.apply_patch(pipe, ratio=0.5)  
+tomesd.apply_patch(pipe, ratio=0.5, merge_attn=False)  
 # compiling causes sampling to crash for me atm
 # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 # pipe.vae = torch.compile(pipe.vae, mode="reduce-overhead", fullgraph=True)
@@ -105,4 +105,4 @@ def run(image_path):
 
 if __name__ == "__main__":
 
-    run("/mnt/newdrive/svd-playground/assets/output.png")
+    run("/mnt/newdrive/svd-playground/assets/dog.png")
