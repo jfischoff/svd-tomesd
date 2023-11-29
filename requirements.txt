@@ -1,0 +1,6 @@
+git+https://github.com/huggingface/diffusers@test-v#egg=diffusers
+torch 
+transformers
+torchvision
+accelerate
+omegaconf
