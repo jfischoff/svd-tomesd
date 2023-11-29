@@ -1,0 +1,3 @@
+[submodule "tomesd"]
+	path = tomesd
+	url = git@github.com:jfischoff/tomesd.git

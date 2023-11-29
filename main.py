@@ -1,118 +1,108 @@
+import gradio as gr
+#import gradio.helpers
 import torch
-from omegaconf import OmegaConf
-from requests import get 
-from safetensors import safe_open
+import os
+from glob import glob
+from pathlib import Path
+from typing import Optional
+
+from diffusers import StableVideoDiffusionPipeline
+from diffusers.utils import load_image, export_to_video
 from PIL import Image
-from io import BytesIO
-from transformers import (
-    CLIPVisionModelWithProjection,
-    CLIPImageProcessor
+
+import uuid
+import random
+from huggingface_hub import hf_hub_download
+import tomesd
+
+#gradio.helpers.CACHED_FOLDER = '/data/cache'
+
+pipe = StableVideoDiffusionPipeline.from_pretrained(
+    "stabilityai/stable-video-diffusion-img2vid-xt", torch_dtype=torch.float16, variant="fp16"
 )
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_video import (
-    StableDiffusionVideoPipeline
-)
-from diffusers.models import (
-    UNetSpatioTemporalConditionModel,
-    AutoencoderKLTemporalDecoder
-)
-from diffusers.schedulers import (
-    EulerDiscreteScheduler
-)
-from convert_svd_to_diffusers import (
-    create_unet_diffusers_config,
-    convert_ldm_unet_checkpoint,
-    convert_ldm_vae_checkpoint
-)
+pipe.to("cuda")
 
-# CONFIGURABLES
-IMAGE_SIZE = 768 # For the UNet and VAE config, not the image we're using to generate
-CONFIG_URL = "https://raw.githubusercontent.com/Stability-AI/generative-models/main/configs/inference/svd.yaml"
-CHECKPOINT_PATH = "/mnt/newdrive/svd-playground/checkpoints/svd.safetensors"
-# CHECKPOINT_PATH = "/mnt/newdrive/svd-playground/checkpoints/svd_xt.safetensors"
-CACHE_DIR = "/home/benjamin/.cache/enfugue/cache"
-TEST_IMAGE = "https://raw.githubusercontent.com/Stability-AI/generative-models/main/assets/test_image.png"
+tomesd.apply_patch(pipe, ratio=0.5)  
+# compiling causes sampling to crash for me atm
+# pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+# pipe.vae = torch.compile(pipe.vae, mode="reduce-overhead", fullgraph=True)
 
-# CKPT
-original_config = OmegaConf.create(get(CONFIG_URL).text)
-state_dict = {}
-with safe_open(CHECKPOINT_PATH, framework="pt", device="cpu") as f:
-    for key in f.keys():
-        state_dict[key] = f.get_tensor(key)
+max_64_bit_int = 2**63 - 1
 
-# VAE
-vae_params = original_config.model.params.first_stage_config.params.decoder_config.params
-block_out_channels = [vae_params.ch * mult for mult in vae_params.ch_mult]
-down_block_types = ["DownEncoderBlock2D"] * len(block_out_channels)
-up_block_types = ["UpBlockTemporalDecoder"] * len(block_out_channels)
+def sample(
+    image: Image,
+    seed: Optional[int] = 42,
+    randomize_seed: bool = False,
+    motion_bucket_id: int = 127,
+    fps_id: int = 6,
+    version: str = "svd_xt",
+    cond_aug: float = 0.02,
+    decoding_t: int = 1,  # Number of frames decoded at a time! This eats most VRAM. Reduce if necessary.
+    device: str = "cuda",
+    output_folder: str = "outputs",
+):
+    print("called sample")
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+        
+    if(randomize_seed):
+        seed = random.randint(0, max_64_bit_int)
+    generator = torch.manual_seed(seed)
+    
+    os.makedirs(output_folder, exist_ok=True)
+    base_count = len(glob(os.path.join(output_folder, "*.mp4")))
+    video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
 
-vae_config = { 
-    "sample_size": IMAGE_SIZE,
-    "in_channels": vae_params.in_channels,
-    "out_channels": vae_params.out_ch,
-    "down_block_types": tuple(down_block_types),
-    # "up_block_types": tuple(up_block_types),
-    "block_out_channels": tuple(block_out_channels),
-    "latent_channels": vae_params.z_channels,
-    "layers_per_block": vae_params.num_res_blocks,
-}   
+    frames = pipe(image, 
+                  decode_chunk_size=decoding_t, 
+                  generator=generator, 
+                  motion_bucket_id=motion_bucket_id, 
+                  noise_aug_strength=0.1,
+                  num_frames=14,
+                  ).frames[0]
+    export_to_video(frames, video_path, fps=fps_id)
+    torch.manual_seed(seed)
+    
+    return video_path, seed
 
-vae = AutoencoderKLTemporalDecoder(**vae_config)
-vae_state_dict = convert_ldm_vae_checkpoint(state_dict, vae_config)
-result = vae.load_state_dict(vae_state_dict, strict=False) # Has to be non-strict, makes me thing my VAE is wrong
-print("result missing keys", result.missing_keys)
-print("result unexpected keys", result.unexpected_keys)
+def resize_image(image, output_size=(1024, 576)):
+    # Calculate aspect ratios
+    target_aspect = output_size[0] / output_size[1]  # Aspect ratio of the desired size
+    image_aspect = image.width / image.height  # Aspect ratio of the original image
 
-# UNET
-config = create_unet_diffusers_config(original_config, image_size=IMAGE_SIZE)
-unet_state_dict = convert_ldm_unet_checkpoint(state_dict, config, path=CHECKPOINT_PATH)
-unet = UNetSpatioTemporalConditionModel.from_config(config)
-unet.load_state_dict(unet_state_dict)
+    # Resize then crop if the original image is larger
+    if image_aspect > target_aspect:
+        # Resize the image to match the target height, maintaining aspect ratio
+        new_height = output_size[1]
+        new_width = int(new_height * image_aspect)
+        resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+        # Calculate coordinates for cropping
+        left = (new_width - output_size[0]) / 2
+        top = 0
+        right = (new_width + output_size[0]) / 2
+        bottom = output_size[1]
+    else:
+        # Resize the image to match the target width, maintaining aspect ratio
+        new_width = output_size[0]
+        new_height = int(new_width / image_aspect)
+        resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+        # Calculate coordinates for cropping
+        left = 0
+        top = (new_height - output_size[1]) / 2
+        right = output_size[0]
+        bottom = (new_height + output_size[1]) / 2
 
-# SCHEDULER
-scheduler = EulerDiscreteScheduler(
-    beta_start=0.00085,
-    beta_end=0.012,
-    beta_schedule="scaled_linear",
-    num_train_timesteps=1000,
-    use_karras_sigmas=True,
-)
+    # Crop the image
+    cropped_image = resized_image.crop((left, top, right, bottom))
+    return cropped_image
 
-# VISION
-image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-    "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-    torch_dtype=torch.float16,
-#     cache_dir=CACHE_DIR
-)
-feature_extractor = CLIPImageProcessor()
 
-# PIPE
-pipe = StableDiffusionVideoPipeline(
-    vae=vae,
-    unet=unet,
-    scheduler=scheduler,
-    image_encoder=image_encoder,
-    feature_extractor=feature_extractor,
-)
-pipe = pipe.to("cuda", dtype=torch.float16)
 
-# INITIAL IMAGE
-image = Image.open(BytesIO(get(TEST_IMAGE).content)).convert("RGB")
-width, height = image.size
-width = (width // 8) * 8
-height = (height // 8) * 8
-image = image.resize((width, height))
+def run(image_path):
+    image = resize_image(Image.open(image_path))
+    video_path, seed = sample(image)
+    return video_path, seed
 
-# INVOKE
-out = pipe(
-    image=image,
-    width=width,
-    height=height,
-    num_frames=14,
-    num_inference_steps=12, # I've tried up to 150 steps
-    decoding_t=1,
-    output_type="pil"
-)
+if __name__ == "__main__":
 
-# SAVE
-frames = out["frames"][0]
-frames[0].save("./output.gif", loop=0, duration=125, save_all=True, append_images=frames[1:])
+    run("/mnt/newdrive/svd-playground/assets/output.png")
